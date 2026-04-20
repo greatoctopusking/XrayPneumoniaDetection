@@ -95,7 +95,7 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
     output_path = os.path.join(RESULTS_DIR, 'submission_1.0.csv')
     with open(output_path, 'w') as f:
-        f.write('ID,TARGET\n')
+        f.write('id,TARGET\n')
         for img_id, pred in zip(test_ids, predictions):
             f.write(f'{img_id},{pred}\n')
     
