@@ -1,11 +1,13 @@
 import os
 import sys
 import argparse
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.dataset import get_train_val_loaders, get_final_test_loader
@@ -35,13 +37,14 @@ def get_optimizer(opt_name, params, lr):
         raise ValueError(f'Unknown optimizer: {opt_name}')
 
 
-def train_epoch(model, loader, criterion, optimizer):
+def train_epoch(model, loader, criterion, optimizer, epoch, total_epochs):
     model.train()
     total_loss = 0
     correct = 0
     total = 0
 
-    for images, labels in loader:
+    pbar = tqdm(loader, desc=f'Epoch {epoch}/{total_epochs} [Train]', unit='batch')
+    for images, labels in pbar:
         images, labels = images.to(DEVICE), labels.to(DEVICE)
 
         optimizer.zero_grad()
@@ -50,17 +53,20 @@ def train_epoch(model, loader, criterion, optimizer):
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * images.size(0)
+        batch_size = images.size(0)
+        total_loss += loss.item() * batch_size
 
         _, predicted = outputs.max(1)
-        total += labels.size(0)
+        total += batch_size
         correct += predicted.eq(labels).sum().item()
+
+        pbar.set_postfix(loss=f'{loss.item():.4f}', acc=f'{correct/total:.4f}')
 
     return total_loss / total, correct / total
 
 
 @torch.no_grad()
-def validate(model, loader, criterion):
+def validate(model, loader, criterion, desc='Val'):
     model.eval()
     total_loss = 0
     correct = 0
@@ -68,20 +74,24 @@ def validate(model, loader, criterion):
     all_preds = []
     all_labels = []
 
-    for images, labels in loader:
+    pbar = tqdm(loader, desc=f'[Validate] {desc}', unit='batch')
+    for images, labels in pbar:
         images, labels = images.to(DEVICE), labels.to(DEVICE)
 
         outputs = model(images)
         loss = criterion(outputs, labels)
 
-        total_loss += loss.item() * images.size(0)
+        batch_size = images.size(0)
+        total_loss += loss.item() * batch_size
 
         _, predicted = outputs.max(1)
-        total += labels.size(0)
+        total += batch_size
         correct += predicted.eq(labels).sum().item()
 
         all_preds.extend(predicted.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
+
+        pbar.set_postfix(loss=f'{loss.item():.4f}', acc=f'{correct/total:.4f}')
 
     return total_loss / total, correct / total, all_preds, all_labels
 
@@ -108,8 +118,10 @@ def train_scenario(model, train_loader, val_loader, scenario_config, scenario_id
     no_improve = 0
 
     for epoch in range(epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer)
-        val_loss, val_acc, val_preds, val_labels = validate(model, val_loader, criterion)
+        t0 = time.time()
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, epoch + 1, epochs)
+        val_loss, val_acc, val_preds, val_labels = validate(model, val_loader, criterion, desc=f'Epoch {epoch+1}/{epochs}')
+        elapsed = time.time() - t0
 
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
@@ -119,7 +131,7 @@ def train_scenario(model, train_loader, val_loader, scenario_config, scenario_id
         val_metrics = compute_metrics(val_labels, val_preds)
         scheduler.step(val_metrics['f1_score'])
 
-        print(f'Epoch {epoch+1:2d}/{epochs} | '
+        print(f'Epoch {epoch+1:2d}/{epochs} | Time: {elapsed:.1f}s | '
               f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | '
               f'Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | '
               f'Val F1: {val_metrics["f1_score"]:.4f}')
