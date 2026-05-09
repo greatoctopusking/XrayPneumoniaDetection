@@ -1,106 +1,79 @@
 import os
-import numpy as np
-from PIL import Image
+import sys
+import argparse
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils.dataset import get_test_loader
+from utils.model import build_efficientnetb3
 
 DATA_DIR = r'D:\GithubRepositories\XrayPneumoniaDetection\data'
+MODELS_DIR = r'D:\GithubRepositories\XrayPneumoniaDetection\models'
 RESULTS_DIR = r'D:\GithubRepositories\XrayPneumoniaDetection\results'
-MODEL_PATH = r'D:\GithubRepositories\XrayPneumoniaDetection\models\model_1.0.pth'
-IMG_SIZE = 64
-BATCH_SIZE = 32
-DEVICE = torch.device('cpu')
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def load_image(path):
-    img = Image.open(path).convert('L')
-    img = img.resize((IMG_SIZE, IMG_SIZE))
-    return np.array(img) / 255.0
 
-def load_test_data():
-    test_dir = os.path.join(DATA_DIR, 'shuffled_test')
-    files = sorted([f for f in os.listdir(test_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
-    
-    X, ids = [], []
-    for fname in files:
-        X.append(load_image(os.path.join(test_dir, fname)))
-        img_id = fname.replace('.png', '').replace('.jpg', '').replace('.jpeg', '')
-        ids.append(img_id)
-    
-    return np.array(X).reshape(-1, 1, IMG_SIZE, IMG_SIZE), ids
+@torch.no_grad()
+def predict(model, loader):
+    model.eval()
+    all_preds = []
+    all_ids = []
 
-class CNN(nn.Module):
-    def __init__(self):
-        super(CNN, self).__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(0.25)
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(0.25)
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(0.25)
-        )
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * (IMG_SIZE//8) * (IMG_SIZE//8), 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Dropout(0.5),
-            nn.Linear(128, 1)
-        )
-    
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.fc(x)
-        return x
+    for images, ids in loader:
+        images = images.to(DEVICE)
+        outputs = model(images)
+        _, predicted = outputs.max(1)
+        all_preds.extend(predicted.cpu().numpy())
+        all_ids.extend(ids)
+
+    return all_preds, all_ids
+
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, default='efficientnetb3_scenario1.pth',
+                        help='Model filename in models/ directory')
+    parser.add_argument('--output', type=str, default='submission_efficientnet.csv',
+                        help='Output CSV filename')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size for inference')
+    args = parser.parse_args()
+
+    model_path = os.path.join(MODELS_DIR, args.model)
+    if not os.path.exists(model_path):
+        alt_path = os.path.join(MODELS_DIR, 'efficientnetb3_scenario1.pth')
+        if os.path.exists(alt_path):
+            model_path = alt_path
+        else:
+            print(f'Model not found: {model_path}')
+            print(f'Available models: {os.listdir(MODELS_DIR)}')
+            sys.exit(1)
+
+    print(f'Loading model: {model_path}')
+    model = build_efficientnetb3(num_classes=2, freeze_backbone=False).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE, weights_only=True))
+    print(f'Device: {DEVICE}')
+
     print('Loading test data...')
-    X_test, test_ids = load_test_data()
-    print(f'Test samples: {len(X_test)}')
-    
-    print('Loading model...')
-    model = CNN().to(DEVICE)
-    model.load_state_dict(torch.load(MODEL_PATH, weights_only=True))
-    model.eval()
-    
-    test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.zeros(len(X_test)))
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    
+    test_loader, test_ids = get_test_loader(batch_size=args.batch_size)
+    print(f'Test samples: {len(test_ids)}')
+
     print('Making predictions...')
-    predictions = []
-    with torch.no_grad():
-        for X_batch, _ in test_loader:
-            X_batch = X_batch.to(DEVICE)
-            outputs = model(X_batch)
-            probs = torch.sigmoid(outputs.squeeze())
-            preds = (probs > 0.5).int()
-            predictions.extend(preds.cpu().numpy())
-    
+    predictions, ids = predict(model, test_loader)
+
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    output_path = os.path.join(RESULTS_DIR, 'submission_1.0.csv')
+    output_path = os.path.join(RESULTS_DIR, args.output)
     with open(output_path, 'w') as f:
         f.write('id,TARGET\n')
-        for img_id, pred in zip(test_ids, predictions):
+        for img_id, pred in zip(ids, predictions):
             f.write(f'{img_id},{pred}\n')
-    
-    print(f'\nSubmission saved to: {output_path}')
-    print(f'Predictions: Normal={np.sum(np.array(predictions)==0)}, Pneumonia={np.sum(np.array(predictions)==1)}')
+
+    normal_count = sum(1 for p in predictions if p == 0)
+    pneumonia_count = sum(1 for p in predictions if p == 1)
+    print(f'\nSubmission saved: {output_path}')
+    print(f'Predictions: Normal={normal_count}, Pneumonia={pneumonia_count}')
+
 
 if __name__ == '__main__':
     main()

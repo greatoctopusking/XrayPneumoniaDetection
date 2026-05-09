@@ -1,207 +1,215 @@
 import os
-import numpy as np
-from PIL import Image
+import sys
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, TensorDataset
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils.dataset import get_train_val_loaders, get_final_test_loader
+from utils.model import build_efficientnetb3, unfreeze_backbone
+from utils.evaluate import compute_metrics, print_metrics, plot_confusion_matrix, plot_training_curves
 
 DATA_DIR = r'D:\GithubRepositories\XrayPneumoniaDetection\data'
-IMG_SIZE = 64
-BATCH_SIZE = 32
-EPOCHS = 15
-DEVICE = torch.device('cpu')
+MODELS_DIR = r'D:\GithubRepositories\XrayPneumoniaDetection\models'
+RESULTS_DIR = r'D:\GithubRepositories\XrayPneumoniaDetection\results'
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def load_image(path):
-    img = Image.open(path).convert('L')
-    img = img.resize((IMG_SIZE, IMG_SIZE))
-    return np.array(img) / 255.0
+SCENARIOS = {
+    1: {'epochs': 20, 'lr': 0.001, 'batch_size': 16, 'optimizer': 'adamax'},
+    2: {'epochs': 30, 'lr': 0.001, 'batch_size': 20, 'optimizer': 'adamax'},
+    3: {'epochs': 30, 'lr': 0.01, 'batch_size': 45, 'optimizer': 'adamax'},
+}
 
-def load_data():
-    X, y = [], []
-    
-    normal_dir = os.path.join(DATA_DIR, 'train', 'NORMAL')
-    pneumonia_dir = os.path.join(DATA_DIR, 'train', 'PNEUMONIA')
-    
-    for fname in os.listdir(normal_dir):
-        if fname.endswith('.jpeg') or fname.endswith('.jpg') or fname.endswith('.png'):
-            X.append(load_image(os.path.join(normal_dir, fname)))
-            y.append(0)
-    
-    for fname in os.listdir(pneumonia_dir):
-        if fname.endswith('.jpeg') or fname.endswith('.jpg') or fname.endswith('.png'):
-            X.append(load_image(os.path.join(pneumonia_dir, fname)))
-            y.append(1)
-    
-    return np.array(X).reshape(-1, 1, IMG_SIZE, IMG_SIZE), np.array(y)
 
-def load_test_data():
-    test_dir = os.path.join(DATA_DIR, 'shuffled_test')
-    files = sorted([f for f in os.listdir(test_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
-    
-    X, ids = [], []
-    for fname in files:
-        X.append(load_image(os.path.join(test_dir, fname)))
-        img_id = fname.replace('.png', '').replace('.jpg', '').replace('.jpeg', '')
-        ids.append(img_id)
-    
-    return np.array(X).reshape(-1, 1, IMG_SIZE, IMG_SIZE), ids
+def get_optimizer(opt_name, params, lr):
+    if opt_name == 'adamax':
+        return optim.Adamax(params, lr=lr)
+    elif opt_name == 'sgd':
+        return optim.SGD(params, lr=lr, momentum=0.9)
+    elif opt_name == 'rmsprop':
+        return optim.RMSprop(params, lr=lr)
+    else:
+        raise ValueError(f'Unknown optimizer: {opt_name}')
 
-def load_val_data():
-    X, y = [], []
-    
-    normal_dir = os.path.join(DATA_DIR, 'val', 'NORMAL')
-    pneumonia_dir = os.path.join(DATA_DIR, 'val', 'PNEUMONIA')
-    
-    for fname in os.listdir(normal_dir):
-        if fname.endswith('.jpeg') or fname.endswith('.jpg') or fname.endswith('.png'):
-            X.append(load_image(os.path.join(normal_dir, fname)))
-            y.append(0)
-    
-    for fname in os.listdir(pneumonia_dir):
-        if fname.endswith('.jpeg') or fname.endswith('.jpg') or fname.endswith('.png'):
-            X.append(load_image(os.path.join(pneumonia_dir, fname)))
-            y.append(1)
-    
-    return np.array(X).reshape(-1, 1, IMG_SIZE, IMG_SIZE), np.array(y)
-
-class CNN(nn.Module):
-    def __init__(self):
-        super(CNN, self).__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(0.25)
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(0.25)
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(0.25)
-        )
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * (IMG_SIZE//8) * (IMG_SIZE//8), 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Dropout(0.5),
-            nn.Linear(128, 1)
-        )
-    
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.fc(x)
-        return x
 
 def train_epoch(model, loader, criterion, optimizer):
     model.train()
     total_loss = 0
-    for X_batch, y_batch in loader:
-        X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
+    correct = 0
+    total = 0
+
+    for images, labels in loader:
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+
         optimizer.zero_grad()
-        outputs = model(X_batch)
-        loss = criterion(outputs.squeeze(), y_batch.float())
+        outputs = model(images)
+        loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
 
-def evaluate(model, loader):
+        total_loss += loss.item() * images.size(0)
+
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+    return total_loss / total, correct / total
+
+
+@torch.no_grad()
+def validate(model, loader, criterion):
     model.eval()
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(DEVICE)
-            outputs = model(X_batch)
-            probs = torch.sigmoid(outputs.squeeze())
-            preds = (probs > 0.5).int()
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(y_batch.numpy())
-    return f1_score(all_labels, all_preds)
+    total_loss = 0
+    correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
 
-def main():
-    print('Loading training data...')
-    X, y = load_data()
-    print(f'Total samples: {len(X)}, Normal: {np.sum(y==0)}, Pneumonia: {np.sum(y==1)}')
-    
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    
-    pos_count = np.sum(y_train == 1)
-    neg_count = np.sum(y_train == 0)
-    class_1_weight = neg_count / pos_count
-    print(f'Class weights: 0=1.0, 1={class_1_weight:.2f}')
-    
-    train_dataset = TensorDataset(
-        torch.FloatTensor(X_train), 
-        torch.LongTensor(y_train)
-    )
-    val_dataset = TensorDataset(
-        torch.FloatTensor(X_val), 
-        torch.LongTensor(y_val)
-    )
-    
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    
-    model = CNN().to(DEVICE)
-    print(model)
-    
-    pos_weight = torch.tensor([class_1_weight])
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, min_lr=1e-6)
-    
+    for images, labels in loader:
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+        total_loss += loss.item() * images.size(0)
+
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+        all_preds.extend(predicted.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+    return total_loss / total, correct / total, all_preds, all_labels
+
+
+def train_scenario(model, train_loader, val_loader, scenario_config, scenario_id):
+    epochs = scenario_config['epochs']
+    lr = scenario_config['lr']
+    opt_name = scenario_config['optimizer']
+
+    print(f'\n{"="*60}')
+    print(f'Scenario {scenario_id}: {opt_name}, lr={lr}, epochs={epochs}, bs={scenario_config["batch_size"]}')
+    print(f'Device: {DEVICE}')
+    print(f'{"="*60}')
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = get_optimizer(opt_name, filter(lambda p: p.requires_grad, model.parameters()), lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, min_lr=1e-7)
+
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+
     best_f1 = 0
     best_model_state = None
-    patience = 3
+    patience = 8
     no_improve = 0
-    
-    print('\nTraining model...')
-    for epoch in range(EPOCHS):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer)
-        val_f1 = evaluate(model, val_loader)
-        scheduler.step(val_f1)
-        
-        print(f'Epoch {epoch+1}/{EPOCHS} - Loss: {train_loss:.4f} - Val F1: {val_f1:.4f}')
-        
-        if val_f1 > best_f1:
-            best_f1 = val_f1
-            best_model_state = model.state_dict().copy()
+
+    for epoch in range(epochs):
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer)
+        val_loss, val_acc, val_preds, val_labels = validate(model, val_loader, criterion)
+
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+
+        val_metrics = compute_metrics(val_labels, val_preds)
+        scheduler.step(val_metrics['f1_score'])
+
+        print(f'Epoch {epoch+1:2d}/{epochs} | '
+              f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | '
+              f'Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | '
+              f'Val F1: {val_metrics["f1_score"]:.4f}')
+
+        if val_metrics['f1_score'] > best_f1:
+            best_f1 = val_metrics['f1_score']
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             no_improve = 0
         else:
             no_improve += 1
             if no_improve >= patience:
                 print(f'Early stopping at epoch {epoch+1}')
                 break
-    
+
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
-        model_path = os.path.join('models', 'model_1.0.pth')
-        torch.save(model.state_dict(), model_path)
-        print(f'Model saved to: {model_path}')
-    print(f'\nBest Validation F1 Score: {best_f1:.4f}')
-    
-    print('\nLoading official validation data (data/val)...')
-    X_val_off, y_val_off = load_val_data()
-    val_off_dataset = TensorDataset(torch.FloatTensor(X_val_off), torch.LongTensor(y_val_off))
-    val_off_loader = DataLoader(val_off_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    val_off_f1 = evaluate(model, val_off_loader)
-    print(f'Official Val F1 Score: {val_off_f1:.4f}')
-    print(f'Official Val: Normal={np.sum(y_val_off==0)}, Pneumonia={np.sum(y_val_off==1)}')
+
+    final_val_loss, final_val_acc, final_preds, final_labels = validate(model, val_loader, criterion)
+    final_metrics = compute_metrics(final_labels, final_preds)
+
+    save_name = f'efficientnetb3_scenario{scenario_id}.pth'
+    save_path = os.path.join(MODELS_DIR, save_name)
+    torch.save(best_model_state, save_path)
+    print(f'\nSaved best model: {save_path}')
+
+    return final_metrics, history
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--scenario', type=int, choices=[1, 2, 3], default=1,
+                        help='Training scenario (1/2/3)')
+    parser.add_argument('--unfreeze_after', type=int, default=0,
+                        help='Unfreeze last N blocks after training head')
+    args = parser.parse_args()
+
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    config = SCENARIOS[args.scenario]
+    print(f'Loading data with batch_size={config["batch_size"]}...')
+    train_loader, val_loader = get_train_val_loaders(batch_size=config['batch_size'])
+    print(f'Train batches: {len(train_loader)}, Val batches: {len(val_loader)}')
+
+    model = build_efficientnetb3(num_classes=2, freeze_backbone=True).to(DEVICE)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'\nTotal params: {total_params:,} | Trainable: {trainable_params:,}')
+
+    print(f'\n--- Phase 1: Training classification head ---')
+    metrics, history = train_scenario(model, train_loader, val_loader, config, args.scenario)
+    print_metrics(metrics, prefix='Phase 1 (Head only)')
+
+    curves_path = os.path.join(RESULTS_DIR, f'training_curves_s{args.scenario}.png')
+    plot_training_curves(history, curves_path)
+    print(f'Training curves saved: {curves_path}')
+
+    if args.unfreeze_after > 0:
+        print(f'\n--- Phase 2: Fine-tuning last {args.unfreeze_after} blocks ---')
+        unfreeze_backbone(model, depth=args.unfreeze_after)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f'Trainable after unfreeze: {trainable_params:,}')
+
+        ft_config = {**config, 'lr': config['lr'] * 0.1}
+        ft_metrics, ft_history = train_scenario(model, train_loader, val_loader, ft_config, f'{args.scenario}_ft')
+        print_metrics(ft_metrics, prefix='Phase 2 (Fine-tuned)')
+
+        curves_path = os.path.join(RESULTS_DIR, f'training_curves_s{args.scenario}_ft.png')
+        plot_training_curves(ft_history, curves_path)
+
+    cm_path = os.path.join(RESULTS_DIR, f'confusion_matrix_val_s{args.scenario}.png')
+    plot_confusion_matrix(metrics['confusion_matrix'], cm_path)
+    print(f'Val confusion matrix saved: {cm_path}')
+
+    print(f'\n{"="*60}')
+    print('Final evaluation on holdout test set (data/val/)')
+    print(f'{"="*60}')
+    test_loader, test_count = get_final_test_loader(batch_size=config['batch_size'])
+    if test_loader is not None:
+        test_criterion = nn.CrossEntropyLoss()
+        _, _, test_preds, test_labels = validate(model, test_loader, test_criterion)
+        test_metrics = compute_metrics(test_labels, test_preds)
+        print_metrics(test_metrics, prefix='Holdout Test')
+
+        cm_path = os.path.join(RESULTS_DIR, f'confusion_matrix_test_s{args.scenario}.png')
+        plot_confusion_matrix(test_metrics['confusion_matrix'], cm_path)
+        print(f'Test confusion matrix saved: {cm_path}')
+
+    print('\nDone!')
+
 
 if __name__ == '__main__':
     main()
